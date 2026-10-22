@@ -92,7 +92,7 @@ mod suballocation;
 mod types;
 mod view;
 
-use alloc::{borrow::ToOwned as _, string::String, sync::Arc, vec::Vec};
+use alloc::{borrow::ToOwned as _, boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::{ffi, fmt, mem, ops::Deref};
 
 use arrayvec::ArrayVec;
@@ -1303,9 +1303,49 @@ pub struct RayTracingPipeline {}
 impl crate::DynRayTracingPipeline for RayTracingPipeline {}
 
 #[derive(Debug)]
-pub struct PipelineCache;
+pub struct PipelineCache {
+    library: Direct3D12::ID3D12PipelineLibrary,
+    library1: Option<Direct3D12::ID3D12PipelineLibrary1>,
+    _blob: Box<[u8]>,
+}
 
 impl crate::DynPipelineCache for PipelineCache {}
+
+unsafe impl Send for PipelineCache {}
+unsafe impl Sync for PipelineCache {}
+
+struct PipelineLibraryHasher(u64);
+
+impl PipelineLibraryHasher {
+    fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    fn write_shader(&mut self, shader: &Direct3D12::D3D12_SHADER_BYTECODE) {
+        if shader.pShaderBytecode.is_null() {
+            return;
+        }
+        let bytes = unsafe {
+            core::slice::from_raw_parts(shader.pShaderBytecode.cast::<u8>(), shader.BytecodeLength)
+        };
+        self.write(&(bytes.len() as u64).to_le_bytes());
+        self.write(bytes);
+    }
+
+    fn name(&self) -> Vec<u16> {
+        alloc::format!("{:016x}", self.0)
+            .encode_utf16()
+            .chain(core::iter::once(0))
+            .collect()
+    }
+}
 
 #[derive(Debug)]
 pub struct AccelerationStructure {

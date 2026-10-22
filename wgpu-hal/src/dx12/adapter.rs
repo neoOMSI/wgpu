@@ -498,6 +498,11 @@ impl super::Adapter {
         }
 
         features.set(
+            wgt::Features::PIPELINE_CACHE,
+            device.cast::<Direct3D12::ID3D12Device1>().is_ok(),
+        );
+
+        features.set(
             wgt::Features::CONSERVATIVE_RASTERIZATION,
             options.ConservativeRasterizationTier
                 != Direct3D12::D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED,

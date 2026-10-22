@@ -1,6 +1,7 @@
 use alloc::borrow::ToOwned;
 use alloc::{
     borrow::Cow,
+    boxed::Box,
     string::{String, ToString as _},
     sync::Arc,
     vec::Vec,
@@ -2252,16 +2253,58 @@ impl crate::Device for super::Device {
                 stream_desc.mesh_shader = blob_ms.as_ref().unwrap().create_native_shader();
             }
         };
+        let library_entry = desc.cache.and_then(|cache| {
+            let library = cache.library1.as_ref()?;
+            let mut hasher = super::PipelineLibraryHasher::new();
+            hasher.write_shader(&stream_desc.vertex_shader);
+            hasher.write_shader(&stream_desc.pixel_shader);
+            hasher.write_shader(&stream_desc.task_shader);
+            hasher.write_shader(&stream_desc.mesh_shader);
+            let state = match &desc.vertex_processor {
+                crate::VertexProcessor::Standard { vertex_buffers, .. } => {
+                    format!("{vertex_buffers:?}")
+                }
+                crate::VertexProcessor::Mesh { .. } => String::new(),
+            };
+            let state = format!(
+                "{state}{:?}{:?}{:?}{:?}{:?}",
+                desc.primitive,
+                desc.depth_stencil,
+                desc.multisample,
+                desc.color_targets,
+                desc.multiview_mask
+            );
+            hasher.write(state.as_bytes());
+            Some((cache, library, hasher.name()))
+        });
         let raw: Direct3D12::ID3D12PipelineState =
             // If stream descriptors are available, use them as they are more flexible.
             if let Ok(device) = self.raw.cast::<Direct3D12::ID3D12Device2>() {
                 // Prefer stream descs where possible
                 let mut stream = stream_desc.to_stream();
-                unsafe {
-                    profiling::scope!("ID3D12Device2::CreatePipelineState");
-                    stream.create_pipeline_state(&device).map_err(|err| {
-                        crate::PipelineError::Linkage(shader_stages, err.to_string())
-                    })?
+                let loaded = library_entry.as_ref().and_then(|(_, library, name)| {
+                    profiling::scope!("ID3D12PipelineLibrary1::LoadPipeline");
+                    unsafe { stream.load_pipeline_state(library, name) }.ok()
+                });
+                match loaded {
+                    Some(raw) => raw,
+                    None => {
+                        let raw = unsafe {
+                            profiling::scope!("ID3D12Device2::CreatePipelineState");
+                            stream.create_pipeline_state(&device).map_err(|err| {
+                                crate::PipelineError::Linkage(shader_stages, err.to_string())
+                            })?
+                        };
+                        if let Some((cache, _, name)) = &library_entry {
+                            profiling::scope!("ID3D12PipelineLibrary::StorePipeline");
+                            let _ = unsafe {
+                                cache
+                                    .library
+                                    .StorePipeline(windows_core::PCWSTR(name.as_ptr()), &raw)
+                            };
+                        }
+                        raw
+                    }
                 }
             } else {
                 unsafe {
@@ -2302,26 +2345,57 @@ impl crate::Device for super::Device {
         let blob_cs =
             self.load_shader(&desc.stage, desc.layout, naga::ShaderStage::Compute, None)?;
 
-        let pair = {
-            profiling::scope!("ID3D12Device::CreateComputePipelineState");
-            unsafe {
-                self.raw.CreateComputePipelineState(
-                    &Direct3D12::D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                        pRootSignature: borrow_optional_interface_temporarily(
-                            &desc.layout.shared.signature,
-                        ),
-                        CS: blob_cs.create_native_shader(),
-                        NodeMask: 0,
-                        CachedPSO: Direct3D12::D3D12_CACHED_PIPELINE_STATE::default(),
-                        Flags: Direct3D12::D3D12_PIPELINE_STATE_FLAG_NONE,
-                    },
-                )
-            }
+        let compute_desc = Direct3D12::D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: unsafe {
+                borrow_optional_interface_temporarily(&desc.layout.shared.signature)
+            },
+            CS: blob_cs.create_native_shader(),
+            NodeMask: 0,
+            CachedPSO: Direct3D12::D3D12_CACHED_PIPELINE_STATE::default(),
+            Flags: Direct3D12::D3D12_PIPELINE_STATE_FLAG_NONE,
         };
 
-        let raw: Direct3D12::ID3D12PipelineState = pair.map_err(|err| {
-            crate::PipelineError::Linkage(wgt::ShaderStages::COMPUTE, err.to_string())
-        })?;
+        let library_entry = desc.cache.map(|cache| {
+            let mut hasher = super::PipelineLibraryHasher::new();
+            hasher.write_shader(&compute_desc.CS);
+            (cache, hasher.name())
+        });
+
+        let loaded = library_entry.as_ref().and_then(|(cache, name)| {
+            profiling::scope!("ID3D12PipelineLibrary::LoadComputePipeline");
+            unsafe {
+                cache.library.LoadComputePipeline::<_, Direct3D12::ID3D12PipelineState>(
+                    windows_core::PCWSTR(name.as_ptr()),
+                    &compute_desc,
+                )
+            }
+                .ok()
+        });
+
+        let raw: Direct3D12::ID3D12PipelineState = match loaded {
+            Some(raw) => raw,
+            None => {
+                let pair = {
+                    profiling::scope!("ID3D12Device::CreateComputePipelineState");
+                    unsafe { self.raw.CreateComputePipelineState(&compute_desc) }
+                };
+
+                let raw: Direct3D12::ID3D12PipelineState = pair.map_err(|err| {
+                    crate::PipelineError::Linkage(wgt::ShaderStages::COMPUTE, err.to_string())
+                })?;
+
+                if let Some((cache, name)) = &library_entry {
+                    profiling::scope!("ID3D12PipelineLibrary::StorePipeline");
+                    let _ = unsafe {
+                        cache
+                            .library
+                            .StorePipeline(windows_core::PCWSTR(name.as_ptr()), &raw)
+                    };
+                }
+
+                raw
+            }
+        };
 
         if let Some(label) = desc.label {
             raw.set_name(label)?;
@@ -2364,11 +2438,49 @@ impl crate::Device for super::Device {
 
     unsafe fn create_pipeline_cache(
         &self,
-        _desc: &crate::PipelineCacheDescriptor<'_>,
+        desc: &crate::PipelineCacheDescriptor<'_>,
     ) -> Result<super::PipelineCache, crate::PipelineCacheError> {
-        Ok(super::PipelineCache)
+        let device1 = self
+            .raw
+            .cast::<Direct3D12::ID3D12Device1>()
+            .map_err(|_| crate::DeviceError::Unexpected)?;
+
+        let mut blob: Box<[u8]> = desc.data.map(Box::from).unwrap_or_default();
+
+        profiling::scope!("ID3D12Device1::CreatePipelineLibrary");
+        let library = match unsafe {
+            device1.CreatePipelineLibrary::<Direct3D12::ID3D12PipelineLibrary>(&blob)
+        } {
+            Ok(library) => library,
+            Err(_) => {
+                blob = Box::default();
+                unsafe {
+                    device1.CreatePipelineLibrary::<Direct3D12::ID3D12PipelineLibrary>(&blob)
+                }
+                    .into_device_result("CreatePipelineLibrary")?
+            }
+        };
+        let library1 = library.cast::<Direct3D12::ID3D12PipelineLibrary1>().ok();
+
+        Ok(super::PipelineCache {
+            library,
+            library1,
+            _blob: blob,
+        })
+    }
+    fn pipeline_cache_validation_key(&self) -> Option<[u8; 16]> {
+        Some(*b"wgpu-dx12-pcache")
     }
     unsafe fn destroy_pipeline_cache(&self, _: super::PipelineCache) {}
+    unsafe fn pipeline_cache_get_data(&self, cache: &super::PipelineCache) -> Option<Vec<u8>> {
+        let size = unsafe { cache.library.GetSerializedSize() };
+        if size == 0 {
+            return None;
+        }
+        let mut data = alloc::vec![0u8; size];
+        unsafe { cache.library.Serialize(&mut data) }.ok()?;
+        Some(data)
+    }
 
     unsafe fn create_query_set(
         &self,

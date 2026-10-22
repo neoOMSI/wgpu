@@ -166,6 +166,25 @@ impl<'a> RenderPipelineStateStream<'a> {
         // of the stream. Other unsafety invariants are upheld by the caller.
         unsafe { device.CreatePipelineState(&stream_desc) }
     }
+
+    /// Loads a pipeline state object matching the stream from a pipeline library.
+    ///
+    /// Safety:
+    /// - All unsafety invariants required by [`ID3D12PipelineLibrary1::LoadPipeline`] must be upheld by the caller.
+    pub unsafe fn load_pipeline_state(
+        &mut self,
+        library: &ID3D12PipelineLibrary1,
+        name: &[u16],
+    ) -> windows::core::Result<ID3D12PipelineState> {
+        let stream_desc = D3D12_PIPELINE_STATE_STREAM_DESC {
+            SizeInBytes: self.bytes.len(),
+            pPipelineStateSubobjectStream: self.bytes.as_mut_ptr().cast(),
+        };
+
+        // Safety: lifetime on Self preserved the contents
+        // of the stream. `name` is null terminated by the caller.
+        unsafe { library.LoadPipeline(windows_core::PCWSTR(name.as_ptr()), &stream_desc) }
+    }
 }
 
 #[repr(C)]

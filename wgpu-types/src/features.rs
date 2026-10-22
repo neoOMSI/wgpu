@@ -877,9 +877,9 @@ features! {
         ///
         /// Supported platforms:
         /// - Vulkan
+        /// - DX12
         ///
         /// Unimplemented Platforms:
-        /// - DX12
         /// - Metal
         #[name("wgpu-pipeline-cache")]
         const PIPELINE_CACHE = 1 << 41;
