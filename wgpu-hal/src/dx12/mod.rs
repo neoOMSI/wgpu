@@ -1240,6 +1240,22 @@ pub(super) struct ShaderCacheKey {
     shader_model: naga::back::hlsl::ShaderModel,
 }
 
+impl ShaderCacheKey {
+    fn stable_hash(&self) -> u64 {
+        let mut hasher = PipelineLibraryHasher::new();
+        for part in [
+            self.source.as_str(),
+            self.entry_point.as_str(),
+            naga::back::hlsl::shader_stage_to_hlsl_str(self.stage),
+            self.shader_model.to_str(),
+        ] {
+            hasher.write(&(part.len() as u64).to_le_bytes());
+            hasher.write(part.as_bytes());
+        }
+        hasher.0
+    }
+}
+
 pub(super) struct ShaderCacheValue {
     /// This is the value of [`ShaderCache::nr_of_shaders_compiled`]
     /// at the time the cache entry was last used.
@@ -1255,6 +1271,13 @@ pub(super) enum CompiledShader {
 }
 
 impl CompiledShader {
+    fn bytes(&self) -> &[u8] {
+        let native = self.create_native_shader();
+        unsafe {
+            core::slice::from_raw_parts(native.pShaderBytecode.cast::<u8>(), native.BytecodeLength)
+        }
+    }
+
     fn create_native_shader(&self) -> Direct3D12::D3D12_SHADER_BYTECODE {
         match self {
             CompiledShader::Dxc(shader) => Direct3D12::D3D12_SHADER_BYTECODE {
@@ -1307,12 +1330,76 @@ pub struct PipelineCache {
     library: Direct3D12::ID3D12PipelineLibrary,
     library1: Option<Direct3D12::ID3D12PipelineLibrary1>,
     _blob: Box<[u8]>,
+    shaders: Mutex<HashMap<u64, Arc<[u8]>>>,
 }
 
 impl crate::DynPipelineCache for PipelineCache {}
 
 unsafe impl Send for PipelineCache {}
 unsafe impl Sync for PipelineCache {}
+
+impl PipelineCache {
+    const MAGIC: &'static [u8; 8] = b"WGPUDX12";
+
+    fn take<'a>(data: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {
+        let (head, tail) = data.split_at_checked(len)?;
+        *data = tail;
+        Some(head)
+    }
+
+    fn take_u32(data: &mut &[u8]) -> Option<u32> {
+        Some(u32::from_le_bytes(Self::take(data, 4)?.try_into().ok()?))
+    }
+
+    fn take_u64(data: &mut &[u8]) -> Option<u64> {
+        Some(u64::from_le_bytes(Self::take(data, 8)?.try_into().ok()?))
+    }
+
+    fn parse(data: &[u8]) -> Option<(&[u8], HashMap<u64, Arc<[u8]>>)> {
+        let mut rest = data.strip_prefix(Self::MAGIC.as_slice())?;
+        let library_len = usize::try_from(Self::take_u64(&mut rest)?).ok()?;
+        let library = Self::take(&mut rest, library_len)?;
+        let count = Self::take_u32(&mut rest)?;
+        let mut shaders = HashMap::new();
+        for _ in 0..count {
+            let key = Self::take_u64(&mut rest)?;
+            let len = usize::try_from(Self::take_u64(&mut rest)?).ok()?;
+            shaders.insert(key, Arc::from(Self::take(&mut rest, len)?));
+        }
+        if !rest.is_empty() {
+            return None;
+        }
+        Some((library, shaders))
+    }
+
+    fn serialize(&self) -> Option<Vec<u8>> {
+        let library_len = unsafe { self.library.GetSerializedSize() };
+        let mut library = alloc::vec![0u8; library_len];
+        if library_len != 0 {
+            unsafe { self.library.Serialize(&mut library) }.ok()?;
+        }
+        let shaders = self.shaders.lock();
+        if library.is_empty() && shaders.is_empty() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(
+            Self::MAGIC.len()
+                + 12
+                + library.len()
+                + shaders.values().map(|s| s.len() + 16).sum::<usize>(),
+        );
+        out.extend_from_slice(Self::MAGIC);
+        out.extend_from_slice(&(library.len() as u64).to_le_bytes());
+        out.extend_from_slice(&library);
+        out.extend_from_slice(&(shaders.len() as u32).to_le_bytes());
+        for (key, shader) in shaders.iter() {
+            out.extend_from_slice(&key.to_le_bytes());
+            out.extend_from_slice(&(shader.len() as u64).to_le_bytes());
+            out.extend_from_slice(shader);
+        }
+        Some(out)
+    }
+}
 
 struct PipelineLibraryHasher(u64);
 
