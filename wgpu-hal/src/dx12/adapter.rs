@@ -1091,12 +1091,16 @@ impl crate::Adapter for super::Adapter {
         // Streamline intercepts command queue creation; the queue it returns forwards to the
         // native one. Everything else keeps using the native device.
         let queue_device = match self.upgrade {
-            Some(upgrade) => unsafe { upgrade_device(&self.device, upgrade) },
+            Some(upgrade) => {
+                // The interposer has to know the device before any of its proxies is used.
+                unsafe { (upgrade.device_ready)(self.device.as_raw()) };
+                unsafe { upgrade_device(&self.device, upgrade) }
+            }
             None => None,
         };
-        let queue_device = queue_device.as_ref().unwrap_or(&self.device);
         let queue: Direct3D12::ID3D12CommandQueue = {
             profiling::scope!("ID3D12Device::CreateCommandQueue");
+            let queue_device = queue_device.as_ref().unwrap_or(&self.device);
             unsafe {
                 queue_device.CreateCommandQueue(&Direct3D12::D3D12_COMMAND_QUEUE_DESC {
                     Type: Direct3D12::D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -1112,6 +1116,7 @@ impl crate::Adapter for super::Adapter {
             self.raw.clone(),
             self.device.clone(),
             queue.clone(),
+            queue_device,
             features,
             limits,
             memory_hints,

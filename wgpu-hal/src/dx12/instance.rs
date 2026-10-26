@@ -1,10 +1,7 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
 
 use wgpu_sync::RwLock;
-use windows::{
-    core::Interface as _,
-    Win32::{Foundation, Graphics::Dxgi},
-};
+use windows::Win32::{Foundation, Graphics::Dxgi};
 
 use super::SurfaceTarget;
 use crate::{
@@ -19,11 +16,12 @@ use crate::{
 ///
 /// The proxy is queried back to the highest factory version wgpu uses; when the interposer
 /// does not proxy the factory (or fails) the caller keeps the native one.
-unsafe fn upgrade_factory(
+pub(super) unsafe fn upgrade_factory(
     factory: DxgiFactory,
     upgrade: super::InterfaceUpgrade,
 ) -> Option<DxgiFactory> {
     use core::ops::Deref as _;
+    use windows::core::Interface as _;
     let base: Dxgi::IDXGIFactory = factory.deref().cast().ok()?;
     let mut raw = base.as_raw();
     // SAFETY: `slUpgradeInterface` replaces the base interface pointer with its proxy.
@@ -43,11 +41,14 @@ unsafe fn upgrade_factory(
         .map(DxgiFactory::Factory4)
 }
 
-/// Creates the DX12 instance, upgrading its DXGI factory through an interposer's
-/// `slUpgradeInterface` (Streamline's) when one is given.
+/// Creates the DirectX 12 instance with an interposer's `slUpgradeInterface` available to it.
+///
+/// The DXGI factory stays native. Every window surface makes the interposer's proxy for it
+/// when its swapchain is created, after the device exists, which the interposer needs; the
+/// adapter announces the device before it makes any proxy.
 ///
 /// # Safety
-/// As [`crate::Instance::init`]; `upgrade` must be a valid `slUpgradeInterface`.
+/// As [`crate::Instance::init`]; `upgrade` must stay valid for the instance's lifetime.
 pub unsafe fn init_with_upgrade(
     desc: &crate::InstanceDescriptor<'_>,
     upgrade: Option<super::InterfaceUpgrade>,
@@ -64,15 +65,8 @@ pub unsafe fn init_with_upgrade(
         device_factory.enable_debug_layer(&lib_main, desc.flags);
 
         let (lib_dxgi, factory) = auxil::dxgi::factory::create_factory(desc.flags)?;
-        // The interposer's factory proxy creates swapchains that it then hooks; the native
-        // factory stays in use for everything else.
-        let factory = match upgrade {
-            Some(upgrade) => match unsafe { upgrade_factory(factory.clone(), upgrade) } {
-                Some(upgraded) => upgraded,
-                None => factory,
-            },
-            None => factory,
-        };
+        // The factory stays native here: the interposer's factory proxy is made per surface,
+        // right before the swapchain, when the device it presents from already exists.
 
         // Create IDXGIFactoryMedia
         let factory_media = lib_dxgi.create_factory_media().ok();
@@ -204,6 +198,8 @@ impl crate::Instance for super::Instance {
                 Ok(super::Surface {
                     factory: self.factory.clone(),
                     factory_media: self.factory_media.clone(),
+                    upgrade: self.upgrade,
+                    proxy_factory: RwLock::new(None),
                     target,
                     supports_allow_tearing: self.supports_allow_tearing,
                     swap_chain: RwLock::new(None),
