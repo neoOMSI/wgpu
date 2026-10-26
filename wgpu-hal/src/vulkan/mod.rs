@@ -190,6 +190,10 @@ pub struct InstanceShared {
     /// It is associated with a `VkInstance` and its children,
     /// except for a `VkPhysicalDevice` and its children.
     instance_api_version: u32,
+    /// Set when the instance was made through an interposer (Streamline).
+    streamline: Option<StreamlineVulkanHooks>,
+    /// The instance-level functions that interposer intercepts.
+    streamline_proxies: StreamlineInstanceProxies,
 
     // The `drop_guard` field must be the last field of this struct so it is dropped last.
     // Do not add new fields after it.
@@ -209,6 +213,8 @@ impl fmt::Debug for InstanceShared {
             has_nv_optimus,
             android_sdk_version,
             instance_api_version,
+            streamline: _,
+            streamline_proxies: _,
             drop_guard: _,
         } = self;
         f.debug_struct("InstanceShared")
@@ -225,6 +231,94 @@ impl fmt::Debug for InstanceShared {
 #[derive(Debug)]
 pub struct Instance {
     shared: Arc<InstanceShared>,
+}
+
+/// An interposer's (Streamline's) Vulkan entry points.
+///
+/// Streamline proxies only the functions listed in its `sl_hooks.h`; the rest of the
+/// addresses it returns are the driver's own. The proxies for the intercepted functions are
+/// resolved once here and used at the few call sites that touch a surface, a swapchain or
+/// presentation, so the rest of wgpu keeps calling the driver directly.
+#[derive(Clone, Copy, Debug)]
+pub struct StreamlineVulkanHooks {
+    pub get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr,
+    pub get_device_proc_addr: vk::PFN_vkGetDeviceProcAddr,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct StreamlineInstanceProxies {
+    pub(crate) create_win32_surface: Option<vk::PFN_vkCreateWin32SurfaceKHR>,
+    pub(crate) destroy_surface: Option<vk::PFN_vkDestroySurfaceKHR>,
+}
+
+impl StreamlineInstanceProxies {
+    /// Resolves the instance-level functions Streamline intercepts.
+    ///
+    /// # Safety
+    /// `instance` must be the instance the hooks belong to.
+    pub(crate) unsafe fn load(hooks: StreamlineVulkanHooks, instance: vk::Instance) -> Self {
+        let get = |name: &CStr| unsafe { instance_proc(hooks, instance, name) };
+        Self {
+            create_win32_surface: unsafe { ptr_to_fn(get(c"vkCreateWin32SurfaceKHR")) },
+            destroy_surface: unsafe { ptr_to_fn(get(c"vkDestroySurfaceKHR")) },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct StreamlineDeviceProxies {
+    pub(crate) create_swapchain: Option<vk::PFN_vkCreateSwapchainKHR>,
+    pub(crate) destroy_swapchain: Option<vk::PFN_vkDestroySwapchainKHR>,
+    pub(crate) get_swapchain_images: Option<vk::PFN_vkGetSwapchainImagesKHR>,
+    pub(crate) acquire_next_image: Option<vk::PFN_vkAcquireNextImageKHR>,
+    pub(crate) queue_present: Option<vk::PFN_vkQueuePresentKHR>,
+    pub(crate) device_wait_idle: Option<vk::PFN_vkDeviceWaitIdle>,
+}
+
+impl StreamlineDeviceProxies {
+    /// Resolves the device-level functions Streamline intercepts.
+    ///
+    /// # Safety
+    /// `device` must be the device the hooks belong to.
+    pub(crate) unsafe fn load(hooks: StreamlineVulkanHooks, device: vk::Device) -> Self {
+        let get = |name: &CStr| unsafe { device_proc(hooks, device, name) };
+        Self {
+            create_swapchain: unsafe { ptr_to_fn(get(c"vkCreateSwapchainKHR")) },
+            destroy_swapchain: unsafe { ptr_to_fn(get(c"vkDestroySwapchainKHR")) },
+            get_swapchain_images: unsafe { ptr_to_fn(get(c"vkGetSwapchainImagesKHR")) },
+            acquire_next_image: unsafe { ptr_to_fn(get(c"vkAcquireNextImageKHR")) },
+            queue_present: unsafe { ptr_to_fn(get(c"vkQueuePresentKHR")) },
+            device_wait_idle: unsafe { ptr_to_fn(get(c"vkDeviceWaitIdle")) },
+        }
+    }
+}
+
+/// A function pointer ash returned for one name, as `T`.
+///
+/// # Safety
+/// `function` must be the address of a function with `T`'s signature.
+unsafe fn ptr_to_fn<T>(function: Option<*const c_void>) -> Option<T> {
+    function.map(|function| unsafe { mem::transmute_copy(&function) })
+}
+
+/// `vkGetInstanceProcAddr` of an interposer, for one name.
+unsafe fn instance_proc(
+    hooks: StreamlineVulkanHooks,
+    instance: vk::Instance,
+    name: &CStr,
+) -> Option<*const c_void> {
+    let function = unsafe { (hooks.get_instance_proc_addr)(instance, name.as_ptr()) }?;
+    Some(function as *const () as *const c_void)
+}
+
+/// `vkGetDeviceProcAddr` of an interposer, for one name.
+unsafe fn device_proc(
+    hooks: StreamlineVulkanHooks,
+    device: vk::Device,
+    name: &CStr,
+) -> Option<*const c_void> {
+    let function = unsafe { (hooks.get_device_proc_addr)(device, name.as_ptr()) }?;
+    Some(function as *const () as *const c_void)
 }
 
 #[expect(missing_debug_implementations, reason = "TODO?")]
@@ -631,6 +725,9 @@ struct DeviceShared {
     texture_view_identity_factory: ResourceIdentityFactory<vk::ImageView>,
 
     empty_descriptor_set_layout: vk::DescriptorSetLayout,
+
+    /// The device-level functions an interposer intercepts, if the instance has one.
+    streamline: StreamlineDeviceProxies,
 
     // The `drop_guard` field must be the last field of this struct so it is dropped last.
     // Do not add new fields after it.

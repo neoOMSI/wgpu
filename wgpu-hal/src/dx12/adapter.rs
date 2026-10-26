@@ -29,6 +29,21 @@ use crate::{
     },
 };
 
+/// Replaces the native device with an interposer's proxy (Streamline's `slUpgradeInterface`).
+///
+/// The proxy is only used to create the command queue; every other call keeps using `device`.
+unsafe fn upgrade_device(
+    device: &Direct3D12::ID3D12Device,
+    upgrade: super::InterfaceUpgrade,
+) -> Option<Direct3D12::ID3D12Device> {
+    let mut raw = device.as_raw();
+    // SAFETY: `slUpgradeInterface` replaces the interface pointer with its proxy.
+    if unsafe { (upgrade.upgrade)(&mut raw) } != 0 || raw.is_null() {
+        return None;
+    }
+    Some(unsafe { Direct3D12::ID3D12Device::from_raw(raw) })
+}
+
 impl Drop for super::Adapter {
     fn drop(&mut self) {
         // Debug tracking alive objects
@@ -72,6 +87,7 @@ impl super::Adapter {
         compiler_container: Arc<shader_compilation::CompilerContainer>,
         backend_options: wgt::Dx12BackendOptions,
         telemetry: Option<crate::Telemetry>,
+        upgrade: Option<super::InterfaceUpgrade>,
     ) -> Option<crate::ExposedAdapter<super::Api>> {
         let desc = unsafe { adapter.GetDesc2() }.unwrap();
         let driver_version = unsafe { adapter.CheckInterfaceSupport(&Dxgi::IDXGIDevice::IID) };
@@ -887,6 +903,7 @@ impl super::Adapter {
                 memory_budget_thresholds,
                 compiler_container,
                 options: backend_options,
+                upgrade,
             },
             info,
             features,
@@ -1071,16 +1088,26 @@ impl crate::Adapter for super::Adapter {
         limits: &wgt::Limits,
         memory_hints: &wgt::MemoryHints,
     ) -> Result<crate::OpenDevice<super::Api>, crate::DeviceError> {
+        // Streamline intercepts command queue creation; the queue it returns forwards to the
+        // native one. Everything else keeps using the native device.
+        let queue_device = match self.upgrade {
+            Some(upgrade) => {
+                // The interposer has to know the device before any of its proxies is used.
+                unsafe { (upgrade.device_ready)(self.device.as_raw()) };
+                unsafe { upgrade_device(&self.device, upgrade) }
+            }
+            None => None,
+        };
         let queue: Direct3D12::ID3D12CommandQueue = {
             profiling::scope!("ID3D12Device::CreateCommandQueue");
+            let queue_device = queue_device.as_ref().unwrap_or(&self.device);
             unsafe {
-                self.device
-                    .CreateCommandQueue(&Direct3D12::D3D12_COMMAND_QUEUE_DESC {
-                        Type: Direct3D12::D3D12_COMMAND_LIST_TYPE_DIRECT,
-                        Priority: Direct3D12::D3D12_COMMAND_QUEUE_PRIORITY_NORMAL.0,
-                        Flags: Direct3D12::D3D12_COMMAND_QUEUE_FLAG_NONE,
-                        NodeMask: 0,
-                    })
+                queue_device.CreateCommandQueue(&Direct3D12::D3D12_COMMAND_QUEUE_DESC {
+                    Type: Direct3D12::D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    Priority: Direct3D12::D3D12_COMMAND_QUEUE_PRIORITY_NORMAL.0,
+                    Flags: Direct3D12::D3D12_COMMAND_QUEUE_FLAG_NONE,
+                    NodeMask: 0,
+                })
             }
             .into_device_result("Queue creation")?
         };
@@ -1089,6 +1116,7 @@ impl crate::Adapter for super::Adapter {
             self.raw.clone(),
             self.device.clone(),
             queue.clone(),
+            queue_device,
             features,
             limits,
             memory_hints,

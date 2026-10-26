@@ -416,7 +416,51 @@ impl super::Instance {
         has_nv_optimus: bool,
         drop_callback: Option<crate::DropCallback>,
     ) -> Result<Self, crate::InstanceError> {
+        unsafe {
+            Self::from_raw_with_streamline(
+                entry,
+                raw_instance,
+                instance_api_version,
+                android_sdk_version,
+                debug_utils_create_info,
+                extensions,
+                flags,
+                memory_budget_thresholds,
+                has_nv_optimus,
+                drop_callback,
+                None,
+            )
+        }
+    }
+
+    /// [`Self::from_raw`] with the entry points of an interposer (Streamline).
+    ///
+    /// # Safety
+    /// As [`Self::from_raw`]; the hooks must be valid for the life of the instance.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn from_raw_with_streamline(
+        entry: ash::Entry,
+        raw_instance: ash::Instance,
+        instance_api_version: u32,
+        android_sdk_version: u32,
+        debug_utils_create_info: Option<super::DebugUtilsCreateInfo>,
+        extensions: Vec<&'static CStr>,
+        flags: wgt::InstanceFlags,
+        memory_budget_thresholds: wgt::MemoryBudgetThresholds,
+        has_nv_optimus: bool,
+        drop_callback: Option<crate::DropCallback>,
+        streamline: Option<super::StreamlineVulkanHooks>,
+    ) -> Result<Self, crate::InstanceError> {
         log::debug!("Instance version: 0x{instance_api_version:x}");
+
+        // The proxies are resolved once; every call site that Streamline intercepts then
+        // uses them instead of the driver's own function.
+        let streamline_proxies = match streamline {
+            Some(hooks) => unsafe {
+                super::StreamlineInstanceProxies::load(hooks, raw_instance.handle())
+            },
+            None => Default::default(),
+        };
 
         let debug_utils = if let Some(debug_utils_create_info) = debug_utils_create_info {
             if extensions.contains(&ext::debug_utils::NAME) {
@@ -470,6 +514,8 @@ impl super::Instance {
                 has_nv_optimus,
                 instance_api_version,
                 android_sdk_version,
+                streamline,
+                streamline_proxies,
             }),
         })
     }
@@ -695,9 +741,25 @@ impl super::Instance {
                 .flags(vk::Win32SurfaceCreateFlagsKHR::empty())
                 .hinstance(hinstance)
                 .hwnd(hwnd);
-            let win32_loader =
-                khr::win32_surface::Instance::new(&self.shared.entry, &self.shared.raw);
-            unsafe { win32_loader.create_win32_surface(&info, None) }
+            match self.shared.streamline_proxies.create_win32_surface {
+                // Streamline has to see the surface to accept the swapchains made for it.
+                Some(create_win32_surface) => unsafe {
+                    let mut surface = vk::SurfaceKHR::null();
+                    create_win32_surface(
+                        self.shared.raw.handle(),
+                        &info,
+                        core::ptr::null(),
+                        &mut surface,
+                    )
+                    .result()
+                    .map(|()| surface)
+                },
+                None => {
+                    let win32_loader =
+                        khr::win32_surface::Instance::new(&self.shared.entry, &self.shared.raw);
+                    unsafe { win32_loader.create_win32_surface(&info, None) }
+                }
+            }
         }
         .map_err(|err| {
             crate::InstanceError::with_source(String::from("Unable to create Win32 surface"), err)
@@ -765,6 +827,21 @@ impl super::Instance {
     pub unsafe fn init_with_callback(
         desc: &crate::InstanceDescriptor<'_>,
         callback: Option<Box<super::CreateInstanceCallback>>,
+    ) -> Result<Self, crate::InstanceError> {
+        unsafe { Self::init_with_callback_and_streamline(desc, callback, None) }
+    }
+
+    /// [`Self::init_with_callback`], with the entry points of an interposer (Streamline)
+    /// that is used instead of the driver for the surface, swapchain and present calls it
+    /// intercepts.
+    ///
+    /// # Safety
+    /// As [`Self::init_with_callback`]; the hooks must be valid for the life of the instance
+    /// and must belong to the interposer that is initialised for this process.
+    pub unsafe fn init_with_callback_and_streamline(
+        desc: &crate::InstanceDescriptor<'_>,
+        callback: Option<Box<super::CreateInstanceCallback>>,
+        streamline: Option<super::StreamlineVulkanHooks>,
     ) -> Result<Self, crate::InstanceError> {
         profiling::scope!("Init Vulkan Backend");
 
@@ -1044,20 +1121,54 @@ impl super::Instance {
                 create_info = create_info.push_next(&mut validation_features);
             }
 
+            // With an interposer (Streamline) the instance is made through its proxy, so it
+            // knows the instance before any surface exists; the function table then comes
+            // from the interposer, which forwards everything it does not intercept.
+            let streamline_create_instance = streamline.and_then(|hooks| unsafe {
+                super::instance_proc(hooks, vk::Instance::null(), c"vkCreateInstance")
+            });
             unsafe {
                 profiling::scope!("vkCreateInstance");
-                entry.create_instance(&create_info, None)
+                match (streamline, streamline_create_instance) {
+                    (Some(_), Some(create)) => {
+                        let create: vk::PFN_vkCreateInstance =
+                            core::mem::transmute(create);
+                        let mut instance = vk::Instance::null();
+                        create(&create_info, core::ptr::null(), &mut instance)
+                            .result()
+                            .map_err(|e| {
+                                crate::InstanceError::with_source(
+                                    String::from("Streamline vkCreateInstance() failed"),
+                                    e,
+                                )
+                            })?;
+                        // The instance itself was made by Streamline's proxy, so Streamline
+                        // knows it before any surface exists. Everything else stays on the
+                        // driver's entry points; only the functions Streamline intercepts are
+                        // called through its proxies (resolved separately).
+                        let get_instance_proc_addr = entry.static_fn().get_instance_proc_addr;
+                        ash::Instance::load_with(
+                            |name| {
+                                get_instance_proc_addr(instance, name.as_ptr()).map_or(
+                                    core::ptr::null(),
+                                    |function| function as *const () as *const c_void,
+                                )
+                            },
+                            instance,
+                        )
+                    }
+                    _ => entry.create_instance(&create_info, None).map_err(|e| {
+                        crate::InstanceError::with_source(
+                            String::from("Entry::create_instance() failed"),
+                            e,
+                        )
+                    })?,
+                }
             }
-            .map_err(|e| {
-                crate::InstanceError::with_source(
-                    String::from("Entry::create_instance() failed"),
-                    e,
-                )
-            })?
         };
 
         unsafe {
-            Self::from_raw(
+            Self::from_raw_with_streamline(
                 entry,
                 vk_instance,
                 instance_api_version,
@@ -1068,6 +1179,7 @@ impl super::Instance {
                 desc.memory_budget_thresholds,
                 has_nv_optimus,
                 None,
+                streamline,
             )
         }
     }

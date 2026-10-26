@@ -6,15 +6,53 @@ use windows::Win32::{Foundation, Graphics::Dxgi};
 use super::SurfaceTarget;
 use crate::{
     auxil,
+    auxil::dxgi::factory::DxgiFactory,
     dx12::{
         device_creation::DeviceFactory, shader_compilation::CompilerContainer, D3D12Lib, DCompLib,
     },
 };
 
-impl crate::Instance for super::Instance {
-    type A = super::Api;
+/// Replaces a native DXGI factory with an interposer's proxy for it.
+///
+/// The proxy is queried back to the highest factory version wgpu uses; when the interposer
+/// does not proxy the factory (or fails) the caller keeps the native one.
+pub(super) unsafe fn upgrade_factory(
+    factory: DxgiFactory,
+    upgrade: super::InterfaceUpgrade,
+) -> Option<DxgiFactory> {
+    use core::ops::Deref as _;
+    use windows::core::Interface as _;
+    let base: Dxgi::IDXGIFactory = factory.deref().cast().ok()?;
+    let mut raw = base.as_raw();
+    // SAFETY: `slUpgradeInterface` replaces the base interface pointer with its proxy.
+    if unsafe { (upgrade.upgrade)(&mut raw) } != 0 || raw.is_null() {
+        return None;
+    }
+    let upgraded = unsafe { Dxgi::IDXGIFactory::from_raw(raw) };
+    if let Ok(factory) = upgraded.cast::<Dxgi::IDXGIFactory6>() {
+        return Some(DxgiFactory::Factory6(factory));
+    }
+    if let Ok(factory) = upgraded.cast::<Dxgi::IDXGIFactory5>() {
+        return Some(DxgiFactory::Factory5(factory));
+    }
+    upgraded
+        .cast::<Dxgi::IDXGIFactory4>()
+        .ok()
+        .map(DxgiFactory::Factory4)
+}
 
-    unsafe fn init(desc: &crate::InstanceDescriptor<'_>) -> Result<Self, crate::InstanceError> {
+/// Creates the DirectX 12 instance with an interposer's `slUpgradeInterface` available to it.
+///
+/// The DXGI factory stays native. Every window surface makes the interposer's proxy for it
+/// when its swapchain is created, after the device exists, which the interposer needs; the
+/// adapter announces the device before it makes any proxy.
+///
+/// # Safety
+/// As [`crate::Instance::init`]; `upgrade` must stay valid for the instance's lifetime.
+pub unsafe fn init_with_upgrade(
+    desc: &crate::InstanceDescriptor<'_>,
+    upgrade: Option<super::InterfaceUpgrade>,
+) -> Result<super::Instance, crate::InstanceError> {
         profiling::scope!("Init DX12 Backend");
         let lib_main = D3D12Lib::new().map_err(|e| {
             crate::InstanceError::with_source(String::from("failed to load d3d12.dll"), e)
@@ -27,6 +65,8 @@ impl crate::Instance for super::Instance {
         device_factory.enable_debug_layer(&lib_main, desc.flags);
 
         let (lib_dxgi, factory) = auxil::dxgi::factory::create_factory(desc.flags)?;
+        // The factory stays native here: the interposer's factory proxy is made per surface,
+        // right before the swapchain, when the device it presents from already exists.
 
         // Create IDXGIFactoryMedia
         let factory_media = lib_dxgi.create_factory_media().ok();
@@ -108,7 +148,7 @@ impl crate::Instance for super::Instance {
             }
         }
 
-        Ok(Self {
+        Ok(super::Instance {
             // The call to create_factory will only succeed if we get a factory4, so this is safe.
             factory,
             factory_media,
@@ -123,7 +163,15 @@ impl crate::Instance for super::Instance {
             compiler_container: Arc::new(compiler_container),
             options: desc.backend_options.dx12.clone(),
             telemetry: desc.telemetry,
+            upgrade,
         })
+}
+
+impl crate::Instance for super::Instance {
+    type A = super::Api;
+
+    unsafe fn init(desc: &crate::InstanceDescriptor<'_>) -> Result<Self, crate::InstanceError> {
+        unsafe { init_with_upgrade(desc, None) }
     }
 
     unsafe fn create_surface(
@@ -150,6 +198,8 @@ impl crate::Instance for super::Instance {
                 Ok(super::Surface {
                     factory: self.factory.clone(),
                     factory_media: self.factory_media.clone(),
+                    upgrade: self.upgrade,
+                    proxy_factory: RwLock::new(None),
                     target,
                     supports_allow_tearing: self.supports_allow_tearing,
                     swap_chain: RwLock::new(None),
@@ -182,6 +232,7 @@ impl crate::Instance for super::Instance {
                     self.compiler_container.clone(),
                     self.options.clone(),
                     self.telemetry,
+                    self.upgrade,
                 )
             })
             .collect()

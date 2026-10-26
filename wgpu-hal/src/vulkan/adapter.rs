@@ -2996,6 +2996,13 @@ impl super::Adapter {
                 .map_err(super::map_host_device_oom_err)?
         };
 
+        let streamline = match self.instance.streamline {
+            Some(hooks) => unsafe {
+                super::StreamlineDeviceProxies::load(hooks, raw_device.handle())
+            },
+            None => Default::default(),
+        };
+
         let shared = Arc::new(super::DeviceShared {
             raw: raw_device,
             family_index,
@@ -3030,6 +3037,7 @@ impl super::Adapter {
             texture_identity_factory: super::ResourceIdentityFactory::new(),
             texture_view_identity_factory: super::ResourceIdentityFactory::new(),
             empty_descriptor_set_layout,
+            streamline,
         });
 
         let relay_semaphores = super::RelaySemaphores::new(&shared)?;

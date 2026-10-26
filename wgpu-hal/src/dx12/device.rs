@@ -44,6 +44,7 @@ impl super::Device {
         adapter: auxil::dxgi::factory::DxgiAdapter,
         raw: Direct3D12::ID3D12Device,
         present_queue: Direct3D12::ID3D12CommandQueue,
+        queue_device: Option<Direct3D12::ID3D12Device>,
         features: wgt::Features,
         limits: &wgt::Limits,
         memory_hints: &wgt::MemoryHints,
@@ -207,6 +208,7 @@ impl super::Device {
         Ok(super::Device {
             raw: raw.clone(),
             present_queue,
+            _queue_device: queue_device,
             idler: super::Idler { fence: idle_fence },
             features,
             shared: Arc::new(shared),

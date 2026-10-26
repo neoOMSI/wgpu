@@ -92,6 +92,8 @@ mod suballocation;
 mod types;
 mod view;
 
+pub use instance::init_with_upgrade;
+
 use alloc::{borrow::ToOwned as _, boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::{ffi, fmt, mem, ops::Deref};
 
@@ -411,6 +413,20 @@ const MAX_IMMEDIATE_SIZE: u32 = 128;
 const MAX_IMMEDIATES: usize = MAX_IMMEDIATE_SIZE as usize / 4;
 const ZERO_BUFFER_SIZE: wgt::BufferAddress = 256 << 10;
 
+/// An interposer's (Streamline's) `slUpgradeInterface`.
+///
+/// The function replaces the pointer it is given with the interposer's proxy for the same
+/// interface, adding its own reference, and returns 0 on success. wgpu-hal keeps the native
+/// object for everything the interposer does not intercept and uses the proxy only for the
+/// calls it does.
+#[derive(Clone, Copy)]
+pub struct InterfaceUpgrade {
+    pub upgrade: unsafe extern "system" fn(*mut *mut ffi::c_void) -> u32,
+    /// Called with the native device right after it is created and before the first command
+    /// queue is made: the interposer must be told the device before its proxies are used.
+    pub device_ready: unsafe extern "system" fn(*mut ffi::c_void),
+}
+
 pub struct Instance {
     factory: DxgiFactory,
     factory_media: Option<Dxgi::IDXGIFactoryMedia>,
@@ -429,6 +445,8 @@ pub struct Instance {
     compiler_container: Arc<shader_compilation::CompilerContainer>,
     options: wgt::Dx12BackendOptions,
     telemetry: Option<crate::Telemetry>,
+    /// The interposer's `slUpgradeInterface`, when one is in use.
+    upgrade: Option<InterfaceUpgrade>,
 }
 
 impl Instance {
@@ -443,6 +461,8 @@ impl Instance {
         Surface {
             factory: self.factory.clone(),
             factory_media: self.factory_media.clone(),
+            upgrade: self.upgrade,
+            proxy_factory: RwLock::new(None),
             target: SurfaceTarget::Visual(visual.to_owned()),
             supports_allow_tearing: self.supports_allow_tearing,
             swap_chain: RwLock::new(None),
@@ -462,6 +482,8 @@ impl Instance {
         Surface {
             factory: self.factory.clone(),
             factory_media: self.factory_media.clone(),
+            upgrade: self.upgrade,
+            proxy_factory: RwLock::new(None),
             target: SurfaceTarget::SurfaceHandle(surface_handle),
             supports_allow_tearing: self.supports_allow_tearing,
             swap_chain: RwLock::new(None),
@@ -480,6 +502,8 @@ impl Instance {
         Surface {
             factory: self.factory.clone(),
             factory_media: self.factory_media.clone(),
+            upgrade: self.upgrade,
+            proxy_factory: RwLock::new(None),
             target: SurfaceTarget::SwapChainPanel(swap_chain_panel.to_owned()),
             supports_allow_tearing: self.supports_allow_tearing,
             swap_chain: RwLock::new(None),
@@ -523,6 +547,12 @@ enum SurfaceTarget {
 pub struct Surface {
     factory: DxgiFactory,
     factory_media: Option<Dxgi::IDXGIFactoryMedia>,
+    /// The interposer's `slUpgradeInterface`, when one is in use: the swapchain has to be made
+    /// by its factory proxy so presentation runs through the interposer.
+    upgrade: Option<InterfaceUpgrade>,
+    /// The proxy made from `factory` on first use. It is made late, when the swapchain is
+    /// created, because the interposer has to know the device the queue belongs to first.
+    proxy_factory: RwLock<Option<DxgiFactory>>,
     target: SurfaceTarget,
     supports_allow_tearing: bool,
     swap_chain: RwLock<Option<SwapChain>>,
@@ -536,6 +566,23 @@ unsafe impl Send for Surface {}
 unsafe impl Sync for Surface {}
 
 impl Surface {
+    /// The factory to create the swapchain with: the interposer's proxy for window targets,
+    /// made on first use, and the plain factory everywhere else.
+    fn swap_chain_factory(&self) -> DxgiFactory {
+        let Some(upgrade) = self.upgrade else {
+            return self.factory.clone();
+        };
+        let mut proxy = self.proxy_factory.write();
+        proxy
+            .get_or_insert_with(|| {
+                // SAFETY: `upgrade` is the interposer's `slUpgradeInterface`; the native factory
+                // outlives the proxy because `self.factory` holds it.
+                unsafe { instance::upgrade_factory(self.factory.clone(), upgrade) }
+                    .unwrap_or_else(|| self.factory.clone())
+            })
+            .clone()
+    }
+
     pub fn swap_chain(&self) -> Option<Dxgi::IDXGISwapChain3> {
         Some(self.swap_chain.read().as_ref()?.raw.clone())
     }
@@ -598,6 +645,8 @@ pub struct Adapter {
     memory_budget_thresholds: wgt::MemoryBudgetThresholds,
     compiler_container: Arc<shader_compilation::CompilerContainer>,
     options: wgt::Dx12BackendOptions,
+    /// The interposer's `slUpgradeInterface`, when one is in use.
+    upgrade: Option<InterfaceUpgrade>,
 }
 
 unsafe impl Send for Adapter {}
@@ -653,6 +702,9 @@ unsafe impl Sync for DeviceShared {}
 pub struct Device {
     raw: Direct3D12::ID3D12Device,
     present_queue: Direct3D12::ID3D12CommandQueue,
+    /// Keep-alive: the interposer's device proxy the present queue was created with. The
+    /// interposer looks it up in its swapchain path, so it has to outlive the queue.
+    _queue_device: Option<Direct3D12::ID3D12Device>,
     idler: Idler,
     features: wgt::Features,
     shared: Arc<DeviceShared>,
@@ -1529,6 +1581,13 @@ impl crate::Surface for Surface {
         // For high latency extra buffers seems excessive, so go with a minimum of 3 and beyond that add 1.
         let swap_chain_buffer = (config.maximum_frame_latency + 1).min(16);
 
+        // Window swapchains are made by the interposer's factory proxy so its presentation
+        // path is used. That proxy is made here, on first use, once the device exists.
+        let factory = match self.target {
+            SurfaceTarget::WndHandle(_) => self.swap_chain_factory(),
+            _ => self.factory.clone(),
+        };
+
         let swap_chain = match self.swap_chain.write().take() {
             //Note: this path doesn't properly re-initialize all of the things
             Some(sc) => {
@@ -1573,7 +1632,7 @@ impl crate::Surface for Surface {
                     | SurfaceTarget::SwapChainPanel(_) => {
                         profiling::scope!("IDXGIFactory2::CreateSwapChainForComposition");
                         unsafe {
-                            self.factory.CreateSwapChainForComposition(
+                            factory.CreateSwapChainForComposition(
                                 &device.present_queue,
                                 &desc,
                                 None,
@@ -1599,7 +1658,7 @@ impl crate::Surface for Surface {
                     SurfaceTarget::WndHandle(hwnd) => {
                         profiling::scope!("IDXGIFactory2::CreateSwapChainForHwnd");
                         unsafe {
-                            self.factory.CreateSwapChainForHwnd(
+                            factory.CreateSwapChainForHwnd(
                                 &device.present_queue,
                                 hwnd,
                                 &desc,
@@ -1691,7 +1750,7 @@ impl crate::Surface for Surface {
             SurfaceTarget::WndHandle(wnd_handle) => {
                 // Disable automatic Alt+Enter handling by DXGI.
                 unsafe {
-                    self.factory.MakeWindowAssociation(
+                    factory.MakeWindowAssociation(
                         wnd_handle,
                         Dxgi::DXGI_MWA_NO_WINDOW_CHANGES | Dxgi::DXGI_MWA_NO_ALT_ENTER,
                     )
