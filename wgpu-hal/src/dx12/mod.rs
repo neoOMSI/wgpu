@@ -411,6 +411,17 @@ const MAX_IMMEDIATE_SIZE: u32 = 128;
 const MAX_IMMEDIATES: usize = MAX_IMMEDIATE_SIZE as usize / 4;
 const ZERO_BUFFER_SIZE: wgt::BufferAddress = 256 << 10;
 
+/// An interposer's (Streamline's) `slUpgradeInterface`.
+///
+/// The function replaces the pointer it is given with the interposer's proxy for the same
+/// interface, adding its own reference, and returns 0 on success. wgpu-hal keeps the native
+/// object for everything the interposer does not intercept and uses the proxy only for the
+/// calls it does.
+#[derive(Clone, Copy)]
+pub struct InterfaceUpgrade {
+    pub upgrade: unsafe extern "system" fn(*mut *mut ffi::c_void) -> u32,
+}
+
 pub struct Instance {
     factory: DxgiFactory,
     factory_media: Option<Dxgi::IDXGIFactoryMedia>,
@@ -429,6 +440,8 @@ pub struct Instance {
     compiler_container: Arc<shader_compilation::CompilerContainer>,
     options: wgt::Dx12BackendOptions,
     telemetry: Option<crate::Telemetry>,
+    /// The interposer's `slUpgradeInterface`, when one is in use.
+    upgrade: Option<InterfaceUpgrade>,
 }
 
 impl Instance {
@@ -598,6 +611,8 @@ pub struct Adapter {
     memory_budget_thresholds: wgt::MemoryBudgetThresholds,
     compiler_container: Arc<shader_compilation::CompilerContainer>,
     options: wgt::Dx12BackendOptions,
+    /// The interposer's `slUpgradeInterface`, when one is in use.
+    upgrade: Option<InterfaceUpgrade>,
 }
 
 unsafe impl Send for Adapter {}
