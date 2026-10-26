@@ -1121,16 +1121,50 @@ impl super::Instance {
                 create_info = create_info.push_next(&mut validation_features);
             }
 
+            // With an interposer (Streamline) the instance is made through its proxy, so it
+            // knows the instance before any surface exists; the function table then comes
+            // from the interposer, which forwards everything it does not intercept.
+            let streamline_create_instance = streamline.and_then(|hooks| unsafe {
+                super::instance_proc(hooks, vk::Instance::null(), c"vkCreateInstance")
+            });
             unsafe {
                 profiling::scope!("vkCreateInstance");
-                entry.create_instance(&create_info, None)
+                match (streamline, streamline_create_instance) {
+                    (Some(_), Some(create)) => {
+                        let create: vk::PFN_vkCreateInstance =
+                            core::mem::transmute(create);
+                        let mut instance = vk::Instance::null();
+                        create(&create_info, core::ptr::null(), &mut instance)
+                            .result()
+                            .map_err(|e| {
+                                crate::InstanceError::with_source(
+                                    String::from("Streamline vkCreateInstance() failed"),
+                                    e,
+                                )
+                            })?;
+                        // The instance itself was made by Streamline's proxy, so Streamline
+                        // knows it before any surface exists. Everything else stays on the
+                        // driver's entry points; only the functions Streamline intercepts are
+                        // called through its proxies (resolved separately).
+                        let get_instance_proc_addr = entry.static_fn().get_instance_proc_addr;
+                        ash::Instance::load_with(
+                            |name| {
+                                get_instance_proc_addr(instance, name.as_ptr()).map_or(
+                                    core::ptr::null(),
+                                    |function| function as *const () as *const c_void,
+                                )
+                            },
+                            instance,
+                        )
+                    }
+                    _ => entry.create_instance(&create_info, None).map_err(|e| {
+                        crate::InstanceError::with_source(
+                            String::from("Entry::create_instance() failed"),
+                            e,
+                        )
+                    })?,
+                }
             }
-            .map_err(|e| {
-                crate::InstanceError::with_source(
-                    String::from("Entry::create_instance() failed"),
-                    e,
-                )
-            })?
         };
 
         unsafe {
