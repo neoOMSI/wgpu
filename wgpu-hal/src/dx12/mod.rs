@@ -103,7 +103,6 @@ use suballocation::Allocator;
 use wgpu_sync::atomic::AtomicU64;
 use wgpu_sync::{Mutex, RwLock};
 use windows::{
-    core::{Free as _, Interface},
     Win32::{
         Foundation,
         Graphics::{
@@ -113,6 +112,7 @@ use windows::{
         },
         System::Threading,
     },
+    core::{Free as _, Interface},
 };
 
 use self::dcomp::DCompLib;
@@ -525,6 +525,8 @@ struct SwapChain {
     /// Handle is freed in [`Self::release_resources()`]
     waitable: Option<Foundation::HANDLE>,
     acquired_count: usize,
+    /// Number of waits on the waitable object that will complete without stalling.
+    pending_present_count: usize,
     present_mode: wgt::PresentMode,
     format: wgt::TextureFormat,
     size: wgt::Extent3d,
@@ -1581,6 +1583,9 @@ impl crate::Surface for Surface {
         // For high latency extra buffers seems excessive, so go with a minimum of 3 and beyond that add 1.
         let swap_chain_buffer = (config.maximum_frame_latency + 1).min(16);
 
+        // A newly-created waitable object can be awaited `maximum_frame_latency` times before stall.
+        let pending_present_count = config.maximum_frame_latency as usize;
+
         // Window swapchains are made by the interposer's factory proxy so its presentation
         // path is used. That proxy is made here, on first use, once the device exists.
         let factory = match self.target {
@@ -1787,6 +1792,7 @@ impl crate::Surface for Surface {
             resources,
             waitable,
             acquired_count: 0,
+            pending_present_count,
             present_mode: config.present_mode,
             format: config.format,
             size: config.extent,
@@ -1823,7 +1829,10 @@ impl crate::Surface for Surface {
             wgt::Dx12UseFrameLatencyWaitableObject::None
             | wgt::Dx12UseFrameLatencyWaitableObject::DontWait => {}
             wgt::Dx12UseFrameLatencyWaitableObject::Wait => {
-                unsafe { sc.wait(timeout) }?;
+                if let Some(remaining) = sc.pending_present_count.checked_sub(1) {
+                    unsafe { sc.wait(timeout) }?;
+                    sc.pending_present_count = remaining;
+                }
             }
         }
 
@@ -1930,6 +1939,7 @@ impl crate::Queue for Queue {
         unsafe { sc.raw.Present(interval, flags) }
             .ok()
             .into_device_result("Present")?;
+        sc.pending_present_count += 1;
 
         Ok(())
     }
