@@ -1131,8 +1131,7 @@ impl super::Instance {
                 profiling::scope!("vkCreateInstance");
                 match (streamline, streamline_create_instance) {
                     (Some(_), Some(create)) => {
-                        let create: vk::PFN_vkCreateInstance =
-                            core::mem::transmute(create);
+                        let create: vk::PFN_vkCreateInstance = core::mem::transmute(create);
                         let mut instance = vk::Instance::null();
                         create(&create_info, core::ptr::null(), &mut instance)
                             .result()
@@ -1149,10 +1148,10 @@ impl super::Instance {
                         let get_instance_proc_addr = entry.static_fn().get_instance_proc_addr;
                         ash::Instance::load_with(
                             |name| {
-                                get_instance_proc_addr(instance, name.as_ptr()).map_or(
-                                    core::ptr::null(),
-                                    |function| function as *const () as *const c_void,
-                                )
+                                get_instance_proc_addr(instance, name.as_ptr())
+                                    .map_or(core::ptr::null(), |function| {
+                                        (function as *const ()).cast::<c_void>()
+                                    })
                             },
                             instance,
                         )

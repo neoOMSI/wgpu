@@ -53,118 +53,112 @@ pub unsafe fn init_with_upgrade(
     desc: &crate::InstanceDescriptor<'_>,
     upgrade: Option<super::InterfaceUpgrade>,
 ) -> Result<super::Instance, crate::InstanceError> {
-        profiling::scope!("Init DX12 Backend");
-        let lib_main = D3D12Lib::new().map_err(|e| {
-            crate::InstanceError::with_source(String::from("failed to load d3d12.dll"), e)
-        })?;
+    profiling::scope!("Init DX12 Backend");
+    let lib_main = D3D12Lib::new().map_err(|e| {
+        crate::InstanceError::with_source(String::from("failed to load d3d12.dll"), e)
+    })?;
 
-        // Create DeviceFactory first so we know which debug path to use
-        let device_factory =
-            DeviceFactory::new(&lib_main, desc.backend_options.dx12.agility_sdk.as_ref())?;
+    // Create DeviceFactory first so we know which debug path to use
+    let device_factory =
+        DeviceFactory::new(&lib_main, desc.backend_options.dx12.agility_sdk.as_ref())?;
 
-        device_factory.enable_debug_layer(&lib_main, desc.flags);
+    device_factory.enable_debug_layer(&lib_main, desc.flags);
 
-        let (lib_dxgi, factory) = auxil::dxgi::factory::create_factory(desc.flags)?;
-        // The factory stays native here: the interposer's factory proxy is made per surface,
-        // right before the swapchain, when the device it presents from already exists.
+    let (lib_dxgi, factory) = auxil::dxgi::factory::create_factory(desc.flags)?;
+    // The factory stays native here: the interposer's factory proxy is made per surface,
+    // right before the swapchain, when the device it presents from already exists.
 
-        // Create IDXGIFactoryMedia
-        let factory_media = lib_dxgi.create_factory_media().ok();
+    // Create IDXGIFactoryMedia
+    let factory_media = lib_dxgi.create_factory_media().ok();
 
-        let mut supports_allow_tearing = false;
-        if let Some(factory5) = factory.as_factory5() {
-            let mut allow_tearing = Foundation::FALSE;
-            let hr = unsafe {
-                factory5.CheckFeatureSupport(
-                    Dxgi::DXGI_FEATURE_PRESENT_ALLOW_TEARING,
-                    <*mut _>::cast(&mut allow_tearing),
-                    size_of_val(&allow_tearing) as u32,
-                )
-            };
+    let mut supports_allow_tearing = false;
+    if let Some(factory5) = factory.as_factory5() {
+        let mut allow_tearing = Foundation::FALSE;
+        let hr = unsafe {
+            factory5.CheckFeatureSupport(
+                Dxgi::DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                <*mut _>::cast(&mut allow_tearing),
+                size_of_val(&allow_tearing) as u32,
+            )
+        };
 
-            match hr {
-                Err(err) => log::warn!("Unable to check for tearing support: {err}"),
-                Ok(()) => supports_allow_tearing = true,
-            }
+        match hr {
+            Err(err) => log::warn!("Unable to check for tearing support: {err}"),
+            Ok(()) => supports_allow_tearing = true,
         }
+    }
 
-        // Initialize the shader compiler
-        let compiler_container = match desc.backend_options.dx12.shader_compiler.clone() {
-            wgt::Dx12Compiler::DynamicDxc { dxc_path } => {
-                CompilerContainer::new_dynamic_dxc(dxc_path.into()).map_err(|e| {
-                    crate::InstanceError::with_source(String::from("Failed to load dynamic DXC"), e)
+    // Initialize the shader compiler
+    let compiler_container = match desc.backend_options.dx12.shader_compiler.clone() {
+        wgt::Dx12Compiler::DynamicDxc { dxc_path } => {
+            CompilerContainer::new_dynamic_dxc(dxc_path.into()).map_err(|e| {
+                crate::InstanceError::with_source(String::from("Failed to load dynamic DXC"), e)
+            })?
+        }
+        wgt::Dx12Compiler::StaticDxc => CompilerContainer::new_static_dxc().map_err(|e| {
+            crate::InstanceError::with_source(String::from("Failed to load static DXC"), e)
+        })?,
+        wgt::Dx12Compiler::Fxc => CompilerContainer::new_fxc().map_err(|e| {
+            crate::InstanceError::with_source(String::from("Failed to load FXC"), e)
+        })?,
+        wgt::Dx12Compiler::Auto => {
+            if cfg!(static_dxc) {
+                // Prefer static DXC if its compiled in
+                CompilerContainer::new_static_dxc().map_err(|e| {
+                    crate::InstanceError::with_source(String::from("Failed to load static DXC"), e)
                 })?
-            }
-            wgt::Dx12Compiler::StaticDxc => CompilerContainer::new_static_dxc().map_err(|e| {
-                crate::InstanceError::with_source(String::from("Failed to load static DXC"), e)
-            })?,
-            wgt::Dx12Compiler::Fxc => CompilerContainer::new_fxc().map_err(|e| {
-                crate::InstanceError::with_source(String::from("Failed to load FXC"), e)
-            })?,
-            wgt::Dx12Compiler::Auto => {
-                if cfg!(static_dxc) {
-                    // Prefer static DXC if its compiled in
-                    CompilerContainer::new_static_dxc().map_err(|e| {
-                        crate::InstanceError::with_source(
-                            String::from("Failed to load static DXC"),
+            } else {
+                // Try to load dynamic DXC
+                let dynamic = CompilerContainer::new_dynamic_dxc("dxcompiler.dll".into());
+                match dynamic {
+                    Ok(v) => v,
+                    Err(super::shader_compilation::GetContainerError::FailedToLoad(..)) => {
+                        // If it can't be found load FXC
+                        CompilerContainer::new_fxc().map_err(|e| {
+                            crate::InstanceError::with_source(String::from("Failed to load FXC"), e)
+                        })?
+                    }
+                    Err(e) => {
+                        // If another error occurs when loading static DXC return that error
+                        return Err(crate::InstanceError::with_source(
+                            String::from("Failed to load dynamic DXC"),
                             e,
-                        )
-                    })?
-                } else {
-                    // Try to load dynamic DXC
-                    let dynamic = CompilerContainer::new_dynamic_dxc("dxcompiler.dll".into());
-                    match dynamic {
-                        Ok(v) => v,
-                        Err(super::shader_compilation::GetContainerError::FailedToLoad(..)) => {
-                            // If it can't be found load FXC
-                            CompilerContainer::new_fxc().map_err(|e| {
-                                crate::InstanceError::with_source(
-                                    String::from("Failed to load FXC"),
-                                    e,
-                                )
-                            })?
-                        }
-                        Err(e) => {
-                            // If another error occurs when loading static DXC return that error
-                            return Err(crate::InstanceError::with_source(
-                                String::from("Failed to load dynamic DXC"),
-                                e,
-                            ));
-                        }
+                        ));
                     }
                 }
             }
-        };
-
-        match compiler_container {
-            CompilerContainer::DynamicDxc(..) => {
-                log::debug!("Using dynamic DXC for shader compilation")
-            }
-            CompilerContainer::StaticDxc(..) => {
-                log::debug!("Using static DXC for shader compilation")
-            }
-            CompilerContainer::Fxc(..) => {
-                log::debug!("Using FXC for shader compilation")
-            }
         }
+    };
 
-        Ok(super::Instance {
-            // The call to create_factory will only succeed if we get a factory4, so this is safe.
-            factory,
-            factory_media,
-            library: Arc::new(lib_main),
-            device_factory: Arc::new(device_factory),
-            dcomp_lib: Arc::new(DCompLib::new()),
-            presentation_system: desc.backend_options.dx12.presentation_system,
-            _lib_dxgi: lib_dxgi,
-            supports_allow_tearing,
-            flags: desc.flags,
-            memory_budget_thresholds: desc.memory_budget_thresholds,
-            compiler_container: Arc::new(compiler_container),
-            options: desc.backend_options.dx12.clone(),
-            telemetry: desc.telemetry,
-            upgrade,
-        })
+    match compiler_container {
+        CompilerContainer::DynamicDxc(..) => {
+            log::debug!("Using dynamic DXC for shader compilation")
+        }
+        CompilerContainer::StaticDxc(..) => {
+            log::debug!("Using static DXC for shader compilation")
+        }
+        CompilerContainer::Fxc(..) => {
+            log::debug!("Using FXC for shader compilation")
+        }
+    }
+
+    Ok(super::Instance {
+        // The call to create_factory will only succeed if we get a factory4, so this is safe.
+        factory,
+        factory_media,
+        library: Arc::new(lib_main),
+        device_factory: Arc::new(device_factory),
+        dcomp_lib: Arc::new(DCompLib::new()),
+        presentation_system: desc.backend_options.dx12.presentation_system,
+        _lib_dxgi: lib_dxgi,
+        supports_allow_tearing,
+        flags: desc.flags,
+        memory_budget_thresholds: desc.memory_budget_thresholds,
+        compiler_container: Arc::new(compiler_container),
+        options: desc.backend_options.dx12.clone(),
+        telemetry: desc.telemetry,
+        upgrade,
+    })
 }
 
 impl crate::Instance for super::Instance {
