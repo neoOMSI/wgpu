@@ -13,26 +13,26 @@ use std::time::Instant;
 use bytemuck::TransparentWrapper;
 use wgpu_sync::Mutex;
 use windows::{
-    core::Interface as _,
     Win32::{
         Foundation,
         Graphics::{Direct3D12, Dxgi},
         System::Threading,
     },
+    core::Interface as _,
 };
 
-use super::{conv, descriptor, D3D12Lib};
+use super::{D3D12Lib, conv, descriptor};
 use crate::{
+    AccelerationStructureEntries, TlasInstance,
     auxil::{
         self,
         dxgi::{name::ObjectExt as _, result::HResult as _},
     },
     dx12::{
+        DCompLib, DynamicStorageBufferOffsets, Event, ShaderCacheKey, ShaderCacheValue,
         borrow_optional_interface_temporarily, pipeline_desc::RenderPipelineStateStreamDesc,
-        shader_compilation, suballocation, DCompLib, DynamicStorageBufferOffsets, Event,
-        ShaderCacheKey, ShaderCacheValue,
+        shader_compilation, suballocation,
     },
-    AccelerationStructureEntries, TlasInstance,
 };
 
 // this has to match Naga's HLSL backend, and also needs to be null-terminated
@@ -289,6 +289,7 @@ impl super::Device {
         naga_stage: naga::ShaderStage,
         fragment_stage: Option<&crate::ProgrammableStage<super::ShaderModule>>,
         cache: Option<&super::PipelineCache>,
+        multisampled: bool,
     ) -> Result<super::CompiledShader, crate::PipelineError> {
         let stage_bit = auxil::map_naga_stage(naga_stage);
 
@@ -362,6 +363,7 @@ impl super::Device {
 
                 let pipeline_options = hlsl::PipelineOptions {
                     entry_point: Some((naga_stage, stage.entry_point.to_string())),
+                    multisampled,
                 };
 
                 //TODO: reuse the writer
@@ -407,7 +409,7 @@ impl super::Device {
             super::ShaderModuleSource::DxilPassthrough(passthrough) => {
                 return Ok(super::CompiledShader::Precompiled(
                     passthrough.shader.clone(),
-                ))
+                ));
             }
         };
 
@@ -2080,6 +2082,7 @@ impl crate::Device for super::Device {
                     naga::ShaderStage::Fragment,
                     None,
                     desc.cache,
+                    1 < desc.multisample.count,
                 )?)
             }
             None => None,
@@ -2194,6 +2197,7 @@ impl crate::Device for super::Device {
                     naga::ShaderStage::Vertex,
                     desc.fragment_stage.as_ref(),
                     desc.cache,
+                    1 < desc.multisample.count,
                 )?);
 
                 for (i, (stride, vbuf)) in vertex_strides.iter_mut().zip(vertex_buffers).enumerate()
@@ -2268,6 +2272,7 @@ impl crate::Device for super::Device {
                         naga::ShaderStage::Task,
                         desc.fragment_stage.as_ref(),
                         desc.cache,
+                        1 < desc.multisample.count,
                     )?)
                 } else {
                     None
@@ -2284,6 +2289,7 @@ impl crate::Device for super::Device {
                     naga::ShaderStage::Mesh,
                     desc.fragment_stage.as_ref(),
                     desc.cache,
+                    1 < desc.multisample.count,
                 )?);
                 stream_desc.task_shader = task_shader;
                 stream_desc.mesh_shader = blob_ms.as_ref().unwrap().create_native_shader();
@@ -2378,14 +2384,14 @@ impl crate::Device for super::Device {
             super::PipelineCache,
         >,
     ) -> Result<super::ComputePipeline, crate::PipelineError> {
-        let blob_cs =
-            self.load_shader(
-                &desc.stage,
-                desc.layout,
-                naga::ShaderStage::Compute,
-                None,
-                desc.cache,
-            )?;
+        let blob_cs = self.load_shader(
+            &desc.stage,
+            desc.layout,
+            naga::ShaderStage::Compute,
+            None,
+            desc.cache,
+            false,
+        )?;
 
         let compute_desc = Direct3D12::D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: unsafe {
@@ -2406,12 +2412,14 @@ impl crate::Device for super::Device {
         let loaded = library_entry.as_ref().and_then(|(cache, name)| {
             profiling::scope!("ID3D12PipelineLibrary::LoadComputePipeline");
             unsafe {
-                cache.library.LoadComputePipeline::<_, Direct3D12::ID3D12PipelineState>(
-                    windows_core::PCWSTR(name.as_ptr()),
-                    &compute_desc,
-                )
+                cache
+                    .library
+                    .LoadComputePipeline::<_, Direct3D12::ID3D12PipelineState>(
+                        windows_core::PCWSTR(name.as_ptr()),
+                        &compute_desc,
+                    )
             }
-                .ok()
+            .ok()
         });
 
         let raw: Direct3D12::ID3D12PipelineState = match loaded {
@@ -2500,9 +2508,7 @@ impl crate::Device for super::Device {
             Ok(library) => library,
             Err(_) => {
                 blob = Box::default();
-                unsafe {
-                    device1.CreatePipelineLibrary::<Direct3D12::ID3D12PipelineLibrary>(&blob)
-                }
+                unsafe { device1.CreatePipelineLibrary::<Direct3D12::ID3D12PipelineLibrary>(&blob) }
                     .into_device_result("CreatePipelineLibrary")?
             }
         };
