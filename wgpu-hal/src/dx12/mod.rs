@@ -103,6 +103,7 @@ use suballocation::Allocator;
 use wgpu_sync::atomic::AtomicU64;
 use wgpu_sync::{Mutex, RwLock};
 use windows::{
+    core::{Free as _, Interface},
     Win32::{
         Foundation,
         Graphics::{
@@ -112,7 +113,6 @@ use windows::{
         },
         System::Threading,
     },
-    core::{Free as _, Interface},
 };
 
 use self::dcomp::DCompLib;
@@ -1400,6 +1400,8 @@ impl crate::DynPipelineCache for PipelineCache {}
 unsafe impl Send for PipelineCache {}
 unsafe impl Sync for PipelineCache {}
 
+type ParsedPipelineCache<'a> = (&'a [u8], HashMap<u64, Arc<[u8]>>);
+
 impl PipelineCache {
     const MAGIC: &'static [u8; 8] = b"WGPUDX12";
 
@@ -1417,7 +1419,7 @@ impl PipelineCache {
         Some(u64::from_le_bytes(Self::take(data, 8)?.try_into().ok()?))
     }
 
-    fn parse(data: &[u8]) -> Option<(&[u8], HashMap<u64, Arc<[u8]>>)> {
+    fn parse(data: &[u8]) -> Option<ParsedPipelineCache<'_>> {
         let mut rest = data.strip_prefix(Self::MAGIC.as_slice())?;
         let library_len = usize::try_from(Self::take_u64(&mut rest)?).ok()?;
         let library = Self::take(&mut rest, library_len)?;

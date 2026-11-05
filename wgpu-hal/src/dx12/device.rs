@@ -13,26 +13,26 @@ use std::time::Instant;
 use bytemuck::TransparentWrapper;
 use wgpu_sync::Mutex;
 use windows::{
+    core::Interface as _,
     Win32::{
         Foundation,
         Graphics::{Direct3D12, Dxgi},
         System::Threading,
     },
-    core::Interface as _,
 };
 
-use super::{D3D12Lib, conv, descriptor};
+use super::{conv, descriptor, D3D12Lib};
 use crate::{
-    AccelerationStructureEntries, TlasInstance,
     auxil::{
         self,
         dxgi::{name::ObjectExt as _, result::HResult as _},
     },
     dx12::{
-        DCompLib, DynamicStorageBufferOffsets, Event, ShaderCacheKey, ShaderCacheValue,
         borrow_optional_interface_temporarily, pipeline_desc::RenderPipelineStateStreamDesc,
-        shader_compilation, suballocation,
+        shader_compilation, suballocation, DCompLib, DynamicStorageBufferOffsets, Event,
+        ShaderCacheKey, ShaderCacheValue,
     },
+    AccelerationStructureEntries, TlasInstance,
 };
 
 // this has to match Naga's HLSL backend, and also needs to be null-terminated

@@ -2,19 +2,19 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use core::ptr;
 use std::thread;
 
-use wgpu_sync::{Mutex, atomic::AtomicU64};
+use wgpu_sync::{atomic::AtomicU64, Mutex};
 use windows::{
+    core::Interface as _,
     Win32::{
         Devices::DeviceAndDriverInstallation::{
-            DIGCF_PRESENT, GUID_DEVCLASS_DISPLAY, HDEVINFO, SP_DEVINFO_DATA, SPDRP_ADDRESS,
-            SPDRP_BUSNUMBER, SPDRP_HARDWAREID, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo,
-            SetupDiGetClassDevsW, SetupDiGetDeviceRegistryPropertyW,
+            SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
+            SetupDiGetDeviceRegistryPropertyW, DIGCF_PRESENT, GUID_DEVCLASS_DISPLAY, HDEVINFO,
+            SPDRP_ADDRESS, SPDRP_BUSNUMBER, SPDRP_HARDWAREID, SP_DEVINFO_DATA,
         },
-        Foundation::{ERROR_NO_MORE_ITEMS, GetLastError},
+        Foundation::{GetLastError, ERROR_NO_MORE_ITEMS},
         Graphics::{Direct3D, Direct3D12, Dxgi},
         UI::WindowsAndMessaging,
     },
-    core::Interface as _,
 };
 
 use super::D3D12Lib;
@@ -24,8 +24,8 @@ use crate::{
         dxgi::{factory::DxgiAdapter, result::HResult},
     },
     dx12::{
-        FeatureLevel, ShaderModel, SurfaceTarget, dcomp::DCompLib, device_creation::DeviceFactory,
-        shader_compilation,
+        dcomp::DCompLib, device_creation::DeviceFactory, shader_compilation, FeatureLevel,
+        ShaderModel, SurfaceTarget,
     },
 };
 

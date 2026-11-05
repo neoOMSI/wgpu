@@ -308,7 +308,7 @@ unsafe fn instance_proc(
     name: &CStr,
 ) -> Option<*const c_void> {
     let function = unsafe { (hooks.get_instance_proc_addr)(instance, name.as_ptr()) }?;
-    Some(function as *const () as *const c_void)
+    Some((function as *const ()).cast::<c_void>())
 }
 
 /// `vkGetDeviceProcAddr` of an interposer, for one name.
@@ -318,7 +318,7 @@ unsafe fn device_proc(
     name: &CStr,
 ) -> Option<*const c_void> {
     let function = unsafe { (hooks.get_device_proc_addr)(device, name.as_ptr()) }?;
-    Some(function as *const () as *const c_void)
+    Some((function as *const ()).cast::<c_void>())
 }
 
 #[expect(missing_debug_implementations, reason = "TODO?")]
