@@ -320,11 +320,27 @@ impl Surface for NativeSurface {
                 .map_err(crate::vulkan::map_host_device_oom_err)?,
         };
 
-        // This fence is only used to throttle acquisition on Windows. It is very important to
-        // avoid bad frame pacing when the Vulkan driver is using a DXGI swapchain. See
-        // https://github.com/gfx-rs/wgpu/issues/8310 and
-        // https://github.com/gfx-rs/wgpu/issues/8354 for more details.
-        let fence = if cfg!(target_os = "windows") {
+        // This fence was introduced by PR #8420 to throttle acquisition on Windows to avoid bad
+        // frame pacing in FIFO mode on NVIDIA (where the Vulkan driver uses a DXGI swapchain bridge;
+        // see https://github.com/gfx-rs/wgpu/issues/8310).
+        //
+        // However, unconditionally waiting on this fence causes a catastrophic 5-20ms frame time
+        // stall inside acquire on AMD adapters (see https://github.com/gfx-rs/wgpu/issues/9559)
+        // and destroys unvsynced/uncapped framerates in Immediate and Mailbox present modes.
+        //
+        // Therefore, only allocate and wait on this fence when on Windows with an NVIDIA adapter
+        // in a FIFO present mode, unless explicitly overridden by `WGPU_VK_ACQUIRE_FENCE`.
+        let needs_fence = match std::env::var("WGPU_VK_ACQUIRE_FENCE").as_deref() {
+            Ok("0" | "false" | "off") => false,
+            Ok("1" | "true" | "on") => true,
+            _ => should_throttle_acquire_with_fence(
+                cfg!(target_os = "windows"),
+                device.shared.vendor_id,
+                config.present_mode,
+            ),
+        };
+
+        let fence = if needs_fence {
             let raw = unsafe {
                 device
                     .shared
@@ -441,11 +457,9 @@ impl Drop for NativeSwapchain {
     fn drop(&mut self) {
         unsafe {
             match self.device.streamline.destroy_swapchain {
-                Some(destroy_swapchain) => destroy_swapchain(
-                    self.device.raw.handle(),
-                    self.raw,
-                    core::ptr::null(),
-                ),
+                Some(destroy_swapchain) => {
+                    destroy_swapchain(self.device.raw.handle(), self.raw, core::ptr::null())
+                }
                 None => self.functor.destroy_swapchain(self.raw, None),
             }
         }
@@ -1055,5 +1069,105 @@ impl<'a> SwapchainSubmissionSemaphoreGuard for NativeSwapchainSubmissionSemaphor
         self.present_semaphores_guard
             .get_submit_signal_semaphore(device)
             .map(SemaphoreType::Binary)
+    }
+}
+
+fn should_throttle_acquire_with_fence(
+    target_windows: bool,
+    vendor_id: u32,
+    present_mode: wgt::PresentMode,
+) -> bool {
+    target_windows
+        && vendor_id == crate::auxil::db::nvidia::VENDOR
+        && matches!(
+            present_mode,
+            wgt::PresentMode::Fifo | wgt::PresentMode::FifoRelaxed | wgt::PresentMode::AutoVsync
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_acquire_fence_throttling_decision() {
+        let nvidia = crate::auxil::db::nvidia::VENDOR;
+        let amd = crate::auxil::db::amd::VENDOR;
+        let intel = crate::auxil::db::intel::VENDOR;
+
+        // Windows + NVIDIA + FIFO variants: throttle to avoid #8310 pacing issues.
+        assert!(should_throttle_acquire_with_fence(
+            true,
+            nvidia,
+            wgt::PresentMode::Fifo
+        ));
+        assert!(should_throttle_acquire_with_fence(
+            true,
+            nvidia,
+            wgt::PresentMode::FifoRelaxed
+        ));
+        assert!(should_throttle_acquire_with_fence(
+            true,
+            nvidia,
+            wgt::PresentMode::AutoVsync
+        ));
+
+        // Windows + NVIDIA + Unvsynced/Immediate modes: never throttle CPU in acquire.
+        assert!(!should_throttle_acquire_with_fence(
+            true,
+            nvidia,
+            wgt::PresentMode::Immediate
+        ));
+        assert!(!should_throttle_acquire_with_fence(
+            true,
+            nvidia,
+            wgt::PresentMode::Mailbox
+        ));
+        assert!(!should_throttle_acquire_with_fence(
+            true,
+            nvidia,
+            wgt::PresentMode::AutoNoVsync
+        ));
+
+        // Windows + AMD: never throttle with fence wait (avoids #9559 5-20ms stall).
+        assert!(!should_throttle_acquire_with_fence(
+            true,
+            amd,
+            wgt::PresentMode::Fifo
+        ));
+        assert!(!should_throttle_acquire_with_fence(
+            true,
+            amd,
+            wgt::PresentMode::Immediate
+        ));
+        assert!(!should_throttle_acquire_with_fence(
+            true,
+            amd,
+            wgt::PresentMode::AutoNoVsync
+        ));
+
+        // Windows + Intel: no throttle.
+        assert!(!should_throttle_acquire_with_fence(
+            true,
+            intel,
+            wgt::PresentMode::Fifo
+        ));
+        assert!(!should_throttle_acquire_with_fence(
+            true,
+            intel,
+            wgt::PresentMode::Immediate
+        ));
+
+        // Non-Windows: never throttle with fence wait.
+        assert!(!should_throttle_acquire_with_fence(
+            false,
+            nvidia,
+            wgt::PresentMode::Fifo
+        ));
+        assert!(!should_throttle_acquire_with_fence(
+            false,
+            amd,
+            wgt::PresentMode::Fifo
+        ));
     }
 }
