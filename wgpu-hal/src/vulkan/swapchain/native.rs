@@ -320,16 +320,9 @@ impl Surface for NativeSurface {
                 .map_err(crate::vulkan::map_host_device_oom_err)?,
         };
 
-        // This fence was introduced by PR #8420 to throttle acquisition on Windows to avoid bad
-        // frame pacing in FIFO mode on NVIDIA (where the Vulkan driver uses a DXGI swapchain bridge;
-        // see https://github.com/gfx-rs/wgpu/issues/8310).
-        //
-        // However, unconditionally waiting on this fence causes a catastrophic 5-20ms frame time
-        // stall inside acquire on AMD adapters (see https://github.com/gfx-rs/wgpu/issues/9559)
-        // and destroys unvsynced/uncapped framerates in Immediate and Mailbox present modes.
-        //
-        // Therefore, only allocate and wait on this fence when on Windows with an NVIDIA adapter
-        // in a FIFO present mode, unless explicitly overridden by `WGPU_VK_ACQUIRE_FENCE`.
+        // The fence avoids bad frame pacing with NVIDIA's Windows DXGI swapchain bridge in FIFO
+        // modes, but adds acquire latency on other adapters and present modes. The environment
+        // variable can override the default decision for diagnosis.
         let needs_fence = match std::env::var("WGPU_VK_ACQUIRE_FENCE").as_deref() {
             Ok("0" | "false" | "off") => false,
             Ok("1" | "true" | "on") => true,
@@ -1081,7 +1074,7 @@ fn should_throttle_acquire_with_fence(
         && vendor_id == crate::auxil::db::nvidia::VENDOR
         && matches!(
             present_mode,
-            wgt::PresentMode::Fifo | wgt::PresentMode::FifoRelaxed | wgt::PresentMode::AutoVsync
+            wgt::PresentMode::Fifo | wgt::PresentMode::FifoRelaxed
         )
 }
 
@@ -1106,7 +1099,7 @@ mod tests {
             nvidia,
             wgt::PresentMode::FifoRelaxed
         ));
-        assert!(should_throttle_acquire_with_fence(
+        assert!(!should_throttle_acquire_with_fence(
             true,
             nvidia,
             wgt::PresentMode::AutoVsync
